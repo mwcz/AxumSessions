@@ -32,15 +32,11 @@ thiserror = "1.0.32"
 http-body = "0.4.5"
 uuid = { version = "1.1.2", features = ["v4", "serde"] }
 http = "0.2.8"
-tower-layer = "0.3.1"
-tower-service = "0.3.2"
 sqlx = { version = "0.6.1", default-features = false, features = [
     "chrono",
     "uuid",
 ], optional = true }
 cookie = { version = "0.16.0", features = ["percent-encode", "private"] }
-futures = "0.3.23"
-bytes = "1.2.1"
 dashmap = "5.3.4"
 redis = { version = "0.21.6", features = ["tokio-comp"], optional = true }
 
