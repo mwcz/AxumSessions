@@ -1,12 +1,12 @@
 use crate::{
-    AxumDatabasePool, AxumSession, AxumSessionConfig, AxumSessionData, AxumSessionTimers,
-    SessionError,
+    AxumDatabasePool, AxumSessionConfig, AxumSessionData, AxumSessionTimers, SessionError,
 };
 use async_trait::async_trait;
-use axum_core::extract::FromRequestParts;
+use axum_core::extract::{FromRef, FromRequestParts};
 use chrono::{Duration, Utc};
 use dashmap::DashMap;
-use http::{self, request::Parts, StatusCode};
+use http::{self, request::Parts};
+use std::convert::Infallible;
 use std::{
     fmt::Debug,
     marker::{Send, Sync},
@@ -44,18 +44,12 @@ impl<T, S> FromRequestParts<S> for AxumSessionStore<T>
 where
     T: AxumDatabasePool + Clone + Debug + Sync + Send + 'static,
     S: Send + Sync,
+    AxumSessionStore<T>: FromRef<S>,
 {
-    type Rejection = (http::StatusCode, &'static str);
+    type Rejection = Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        parts
-            .extensions
-            .get::<AxumSessionStore<T>>()
-            .cloned()
-            .ok_or((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Can't extract AxumSession. Is `AxumSessionLayer` enabled?",
-            ))
+    async fn from_request_parts(_parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Ok(AxumSessionStore::<T>::from_ref(state))
     }
 }
 
@@ -323,23 +317,5 @@ where
         }
 
         Ok(())
-    }
-
-    /// Attempts to load check and clear Data.
-    ///
-    /// If no session is found returns false.
-    pub(crate) fn service_session_data(&self, session: &AxumSession<T>) -> bool {
-        if let Some(mut inner) = self.inner.get_mut(&session.id.inner()) {
-            if !inner.validate() || inner.destroy {
-                inner.destroy = false;
-                inner.longterm = false;
-                inner.data.clear();
-            }
-
-            inner.autoremove = Utc::now() + self.config.memory_lifespan;
-            return true;
-        }
-
-        false
     }
 }

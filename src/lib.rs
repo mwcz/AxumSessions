@@ -2,10 +2,9 @@
 #![allow(dead_code)]
 
 mod config;
+mod cookies;
 pub mod databases;
 mod errors;
-mod layer;
-mod service;
 mod session;
 mod session_data;
 mod session_id;
@@ -13,13 +12,12 @@ mod session_store;
 mod session_timers;
 
 pub use config::{AxumSessionConfig, AxumSessionMode, Key, SameSite};
+
 pub use databases::*;
 pub use errors::SessionError;
-pub use layer::AxumSessionLayer;
 pub use session::AxumSession;
 pub use session_store::AxumSessionStore;
 
-pub(crate) use service::{AxumSessionService, CookiesExt};
 pub(crate) use session_data::AxumSessionData;
 pub(crate) use session_id::AxumSessionID;
 pub(crate) use session_timers::AxumSessionTimers;
@@ -51,10 +49,10 @@ mod tests {
 
         let mut connect_opts = PgConnectOptions::new();
         connect_opts.log_statements(LevelFilter::Debug);
-        connect_opts = connect_opts.database("postgres");
-        connect_opts = connect_opts.username("postgres");
-        connect_opts = connect_opts.password("password");
-        connect_opts = connect_opts.host("localhost");
+        connect_opts = connect_opts.database("sforum");
+        connect_opts = connect_opts.username("sforum");
+        connect_opts = connect_opts.password("testpass");
+        connect_opts = connect_opts.host("usmikzo-rp01");
         connect_opts = connect_opts.port(5432);
 
         let pool = PgPoolOptions::new()
@@ -67,10 +65,9 @@ mod tests {
         //generate the table needed!
         session_store.initiate().await.unwrap();
 
-        let app = Router::new()
+        let app = Router::with_state(session_store)
             .route("/set_session", get(set_session))
-            .route("/test_session", get(test_session))
-            .layer(AxumSessionLayer::new(session_store));
+            .route("/test_session", get(test_session));
 
         #[derive(Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
         pub struct Test {
@@ -78,17 +75,21 @@ mod tests {
             b: String,
         }
 
-        async fn set_session(session: AxumSession<AxumPgPool>) -> Redirect {
+        async fn set_session(
+            session: AxumSession<AxumPgPool>,
+        ) -> (AxumSession<AxumPgPool>, Redirect) {
             let test = Test {
                 a: 2,
                 b: "Hello World".to_owned(),
             };
 
             session.set("test", test).await;
-            Redirect::to("/")
+            (session.finalize().await, Redirect::to("/"))
         }
 
-        async fn test_session(session: AxumSession<AxumPgPool>) -> String {
+        async fn test_session(
+            session: AxumSession<AxumPgPool>,
+        ) -> (AxumSession<AxumPgPool>, String) {
             let test: Test = session.get("test").await.unwrap_or_default();
             let other = Test {
                 a: 2,
@@ -96,9 +97,9 @@ mod tests {
             };
 
             if test == other {
-                "Success".to_owned()
+                (session.finalize().await, "Success".to_owned())
             } else {
-                "Failed".to_owned()
+                (session.finalize().await, "Failed".to_owned())
             }
         }
 

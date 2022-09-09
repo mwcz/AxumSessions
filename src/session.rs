@@ -1,10 +1,16 @@
-use crate::{AxumDatabasePool, AxumSessionData, AxumSessionID, AxumSessionStore, CookiesExt};
+use crate::{cookies::*, AxumDatabasePool, AxumSessionData, AxumSessionID, AxumSessionStore};
 use async_trait::async_trait;
-use axum_core::extract::FromRequestParts;
+use axum_core::{
+    extract::{FromRef, FromRequestParts},
+    response::{IntoResponse, IntoResponseParts, Response, ResponseParts},
+};
+use chrono::Utc;
 use cookie::CookieJar;
-use http::{self, request::Parts, StatusCode};
+use http::{self, request::Parts};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
+    boxed::Box,
+    convert::Infallible,
     fmt::Debug,
     marker::{Send, Sync},
 };
@@ -22,6 +28,7 @@ where
 {
     pub(crate) store: AxumSessionStore<T>,
     pub(crate) id: AxumSessionID,
+    pub(crate) accepted: bool,
 }
 
 /// Adds FromRequestParts<B> for AxumSession
@@ -32,14 +39,114 @@ impl<T, S> FromRequestParts<S> for AxumSession<T>
 where
     T: AxumDatabasePool + Clone + Debug + Sync + Send + 'static,
     S: Send + Sync,
+    AxumSessionStore<T>: FromRef<S>,
 {
-    type Rejection = (http::StatusCode, &'static str);
+    type Rejection = Infallible;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        parts.extensions.get::<AxumSession<T>>().cloned().ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Can't extract AxumSession. Is `AxumSessionLayer` enabled?",
-        ))
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let store = AxumSessionStore::<T>::from_ref(state);
+        let cookies = get_cookies(&mut parts.headers);
+        let accepted = cookies
+            .get_cookie(&store.config.storable_cookie_name, &store.config.key)
+            .map_or(false, |c| c.value().parse().unwrap_or(false));
+        let session = AxumSession::new(store, &cookies, accepted);
+
+        // Check if the session id exists if not lets check if it exists in the database or generate a new session.
+        if !session.service_session_data() {
+            let mut data = session
+                .store
+                .load_session(session.id.inner())
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    AxumSessionData::new(session.id.0, accepted, &session.store.config)
+                });
+
+            if !data.validate() || data.destroy {
+                data.destroy = false;
+                data.data.clear();
+                data.autoremove = Utc::now() + session.store.config.memory_lifespan;
+            }
+
+            session.store.inner.insert(session.id.inner(), data);
+        }
+
+        let (last_sweep, last_database_sweep) = {
+            let timers = session.store.timers.read().await;
+            (timers.last_expiry_sweep, timers.last_database_expiry_sweep)
+        };
+
+        // This branch runs less often, and we already have write access,
+        // let's check if any sessions expired. We don't want to hog memory
+        // forever by abandoned sessions (e.g. when a client lost their cookie)
+        // throttle by memory lifespan - e.g. sweep every hour
+        if last_sweep <= Utc::now() {
+            session
+                .store
+                .inner
+                .retain(|_k, v| v.autoremove > Utc::now());
+            session.store.timers.write().await.last_expiry_sweep =
+                Utc::now() + session.store.config.memory_lifespan;
+        }
+
+        // Throttle by database lifespan - e.g. sweep every 6 hours
+        if last_database_sweep <= Utc::now() && session.store.is_persistent() {
+            session.store.cleanup().await.unwrap();
+            session
+                .store
+                .timers
+                .write()
+                .await
+                .last_database_expiry_sweep = Utc::now() + session.store.config.lifespan;
+        }
+
+        Ok(session)
+    }
+}
+
+impl<T> IntoResponseParts for AxumSession<T>
+where
+    T: AxumDatabasePool + Clone + Debug + Sync + Send + 'static,
+{
+    type Error = Infallible;
+
+    fn into_response_parts(self, mut res: ResponseParts) -> Result<ResponseParts, Self::Error> {
+        let storable = if let Some(session_data) = self.store.inner.get(&self.id.inner()) {
+            session_data.storable
+        } else {
+            false
+        };
+
+        let mut cookies = CookieJar::new();
+        // Add the Storable Cookie so we can keep track if they can store the session.
+        cookies.add_cookie(
+            create_cookie(
+                &self.store.config,
+                storable.to_string(),
+                CookieType::Storable,
+            ),
+            &self.store.config.key,
+        );
+
+        // Add the Session ID so it can link back to a Session if one exists.
+        cookies.add_cookie(
+            create_cookie(&self.store.config, self.id.inner(), CookieType::Data),
+            &self.store.config.key,
+        );
+
+        set_cookies(cookies, res.headers_mut());
+
+        Ok(res)
+    }
+}
+
+impl<T> IntoResponse for AxumSession<T>
+where
+    T: AxumDatabasePool + Clone + Debug + Sync + Send + 'static,
+{
+    fn into_response(self) -> Response {
+        (self, ()).into_response()
     }
 }
 
@@ -47,7 +154,11 @@ impl<S> AxumSession<S>
 where
     S: AxumDatabasePool + Clone + Debug + Sync + Send + 'static,
 {
-    pub(crate) fn new(store: &AxumSessionStore<S>, cookies: &CookieJar) -> AxumSession<S> {
+    pub(crate) fn new(
+        store: AxumSessionStore<S>,
+        cookies: &CookieJar,
+        accepted: bool,
+    ) -> AxumSession<S> {
         let value = cookies
             .get_cookie(&store.config.cookie_name, &store.config.key)
             .and_then(|c| Uuid::parse_str(c.value()).ok());
@@ -65,7 +176,8 @@ where
 
         AxumSession {
             id: AxumSessionID(uuid),
-            store: store.clone(),
+            store,
+            accepted,
         }
     }
     /// Runs a Closure upon the Current Sessions stored data to get or set session data.
@@ -233,5 +345,72 @@ where
         } else {
             self.store.inner.len() as i64
         }
+    }
+
+    /// Finalizes the Sessions data by updating the database.
+    ///
+    /// # Examples
+    /// ```rust ignore
+    /// session.finalize().await;
+    /// ```
+    ///
+    #[inline]
+    pub async fn finalize(self) -> Self {
+        if (!self.store.config.session_mode.is_storable() || self.accepted)
+            && self.store.is_persistent()
+        {
+            let sess = if let Some(mut sess) = self.store.inner.get_mut(&self.id.inner()) {
+                if self.store.config.always_save
+                    || sess.update
+                    || sess.expires - Utc::now() <= self.store.config.expiration_update
+                {
+                    if sess.longterm {
+                        sess.expires = Utc::now() + self.store.config.max_lifespan;
+                    } else {
+                        sess.expires = Utc::now() + self.store.config.lifespan;
+                    };
+
+                    sess.update = false;
+                    Some(sess.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(sess) = sess {
+                self.store.store_session(&sess).await.unwrap()
+            }
+        }
+
+        if self.store.config.session_mode.is_storable() && !self.accepted {
+            self.store.inner.remove(&self.id.inner());
+
+            // Also run this just in case it was stored in the database and they rejected storability.
+            if self.store.is_persistent() {
+                self.store.destroy_session(&self.id.inner()).await.unwrap();
+            }
+        }
+
+        self
+    }
+
+    /// Attempts to load check and clear Data.
+    ///
+    /// If no session is found returns false.
+    pub(crate) fn service_session_data(&self) -> bool {
+        if let Some(mut inner) = self.store.inner.get_mut(&self.id.inner()) {
+            if !inner.validate() || inner.destroy {
+                inner.destroy = false;
+                inner.longterm = false;
+                inner.data.clear();
+            }
+
+            inner.autoremove = Utc::now() + self.store.config.memory_lifespan;
+            return true;
+        }
+
+        false
     }
 }
