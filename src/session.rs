@@ -347,7 +347,8 @@ where
         }
     }
 
-    /// Finalizes the Sessions data by updating the database.
+    /// Finalizes the Sessions data by updating the database. Hoping to get async IntoResponseParts.
+    /// Till then this function will exist.
     ///
     /// # Examples
     /// ```rust ignore
@@ -355,7 +356,7 @@ where
     /// ```
     ///
     #[inline]
-    pub async fn finalize(self) -> Self {
+    pub async fn finalize(&self) {
         if (!self.store.config.session_mode.is_storable() || self.accepted)
             && self.store.is_persistent()
         {
@@ -392,8 +393,6 @@ where
                 self.store.destroy_session(&self.id.inner()).await.unwrap();
             }
         }
-
-        self
     }
 
     /// Attempts to load check and clear Data.

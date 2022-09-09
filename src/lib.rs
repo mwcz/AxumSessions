@@ -84,7 +84,8 @@ mod tests {
             };
 
             session.set("test", test).await;
-            (session.finalize().await, Redirect::to("/"))
+            session.finalize().await;
+            (session, Redirect::to("/"))
         }
 
         async fn test_session(
@@ -96,10 +97,12 @@ mod tests {
                 b: "Hello World".to_owned(),
             };
 
+            session.finalize().await;
+
             if test == other {
-                (session.finalize().await, "Success".to_owned())
+                (session, "Success".to_owned())
             } else {
-                (session.finalize().await, "Failed".to_owned())
+                (session, "Failed".to_owned())
             }
         }
 
